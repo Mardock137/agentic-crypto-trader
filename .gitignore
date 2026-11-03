@@ -1,0 +1,52 @@
+## Python / venv / caches
+.venv/
+.venv_backup/
+venv/
+ENV/
+env/
+
+__pycache__/
+pytest_cache/
+*.py[cod]
+*.pyd
+*.so
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+## Local data & runtime output
+data/
+logs/
+*.log
+*.sqlite
+*.db
+
+## Secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+credentials.json
+secrets/
+
+## OS / IDE files / Support files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+dev_support/
+docs/TEMPLATE.md
+.cursor/
+.vscode/
+.idea/

@@ -1,0 +1,886 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from src.core.contracts import (
+    ExecutionReport,
+    ExecutionStatus,
+    MarketAnalysis,
+    MarketBias,
+    OrderType,
+    RiskAssessment,
+    RiskDecision,
+    SuggestedAction,
+    TradeAction,
+    TradeProposal,
+    TradeProposalDetails,
+    TradingCycleResult,
+)
+from src.utils.memory_manager import MemoryManager
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+
+def _make_result(
+    action: TradeAction = TradeAction.BUY,
+    execution_status: ExecutionStatus = ExecutionStatus.EXECUTED,
+    confidence: float = 0.75,
+    quantity: float | None = 0.001,
+) -> TradingCycleResult:
+    return TradingCycleResult(
+        market_analysis=MarketAnalysis(
+            market_bias=MarketBias.BULLISH,
+            signal_strength=0.8,
+            confidence=0.7,
+            summary="Test analysis",
+            suggested_action=SuggestedAction.LONG_BIAS,
+        ),
+        trade_proposal=TradeProposal(
+            action=action,
+            order_type=OrderType.MARKET,
+            confidence=confidence,
+            reason="Test reason",
+            details=TradeProposalDetails(quantity=quantity),
+        ),
+        risk_assessment=RiskAssessment(
+            risk_decision=RiskDecision.APPROVE,
+            confidence=0.9,
+            reason="Test risk",
+        ),
+        execution_report=ExecutionReport(
+            execution_status=execution_status,
+            executed_action=action,
+            order_type=OrderType.MARKET,
+            reason="Test execution",
+        ),
+    )
+
+
+# ------------------------------------------------------------------
+# _symbol_path — whitelist regex
+# ------------------------------------------------------------------
+
+
+def test_symbol_path_rejects_path_traversal(tmp_path: Path) -> None:
+    """_symbol_path deve rifiutare simboli con caratteri non ammessi (path traversal)."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    with pytest.raises(ValueError, match="Symbol non valido"):
+        mm._symbol_path("../secrets")
+
+
+def test_symbol_path_rejects_lowercase(tmp_path: Path) -> None:
+    """_symbol_path deve rifiutare simboli con lettere minuscole."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    with pytest.raises(ValueError, match="Symbol non valido"):
+        mm._symbol_path("btcusdc")
+
+
+def test_symbol_path_accepts_valid_symbol(tmp_path: Path) -> None:
+    """_symbol_path deve accettare simboli di trading validi."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    path = mm._symbol_path("BTCUSDC")
+    assert path == tmp_path / "BTCUSDC.jsonl"
+
+
+# ------------------------------------------------------------------
+# save_cycle
+# ------------------------------------------------------------------
+
+
+def test_save_cycle_creates_jsonl_file(tmp_path: Path) -> None:
+    """save_cycle deve creare il file JSONL per il simbolo."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(symbol="BTCUSDC", result=_make_result(), current_price=67000.0)
+
+    assert (tmp_path / "BTCUSDC.jsonl").exists()
+
+
+def test_save_cycle_writes_expected_fields(tmp_path: Path) -> None:
+    """save_cycle deve scrivere tutti i campi attesi nel record JSONL."""
+    import json
+
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(symbol="BTCUSDC", result=_make_result(), current_price=67000.0)
+
+    lines = (tmp_path / "BTCUSDC.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+
+    record = json.loads(lines[0])
+    assert record["action"] == "BUY"
+    assert record["order_type"] == "MARKET"
+    assert record["execution_status"] == "EXECUTED"
+    assert record["risk_decision"] == "APPROVE"
+    assert record["market_bias"] == "BULLISH"
+    assert record["price"] == pytest.approx(67000.0)
+    assert "timestamp" in record
+
+
+# ------------------------------------------------------------------
+# get_memory
+# ------------------------------------------------------------------
+
+
+def test_get_memory_returns_last_10(tmp_path: Path) -> None:
+    """get_memory deve ritornare le ultime 10 decisioni anche se ce ne sono 15."""
+    mm = MemoryManager(memory_dir=tmp_path)
+
+    for i in range(15):
+        mm.save_cycle(
+            symbol="BTCUSDC",
+            result=_make_result(confidence=float(i) / 100),
+            current_price=float(60000 + i),
+        )
+
+    records = mm.get_memory("BTCUSDC")
+    assert len(records) == 10
+    assert records[0]["price"] == pytest.approx(60005.0)
+    assert records[-1]["price"] == pytest.approx(60014.0)
+
+
+def test_get_memory_returns_empty_for_missing_symbol(tmp_path: Path) -> None:
+    """get_memory deve ritornare lista vuota se il simbolo non ha file."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    assert mm.get_memory("ETHUSDC") == []
+
+
+# ------------------------------------------------------------------
+# get_recent_performance
+# ------------------------------------------------------------------
+
+
+def test_get_recent_performance_buy_has_no_pnl_fields(tmp_path: Path) -> None:
+    """get_recent_performance: i record BUY non devono avere realized_pnl o pnl_pct."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(symbol="BTCUSDC", result=_make_result(action=TradeAction.BUY), current_price=65000.0)
+
+    perf = mm.get_recent_performance("BTCUSDC")
+    assert len(perf) == 1
+    assert perf[0]["action"] == "BUY"
+    assert "realized_pnl" not in perf[0]
+    assert "pnl_pct" not in perf[0]
+
+
+def test_get_recent_performance_sell_has_pnl_fields(tmp_path: Path) -> None:
+    """get_recent_performance: una SELL dopo un BUY deve avere realized_pnl e pnl_pct."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    perf = mm.get_recent_performance("BTCUSDC")
+    sell_entry = next(e for e in perf if e["action"] == "SELL")
+    assert "realized_pnl" in sell_entry
+    assert "pnl_pct" in sell_entry
+    assert sell_entry["realized_pnl"] == pytest.approx(3.0, rel=1e-3)
+    assert sell_entry["pnl_pct"] == pytest.approx(3.75, rel=1e-3)
+
+
+def test_get_recent_performance_includes_quantity(tmp_path: Path) -> None:
+    """get_recent_performance deve includere il campo quantity nei record."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.002),
+        current_price=70000.0,
+    )
+
+    perf = mm.get_recent_performance("BTCUSDC")
+    assert perf[0]["quantity"] == pytest.approx(0.002)
+
+
+def test_get_recent_performance_returns_empty_for_missing_symbol(tmp_path: Path) -> None:
+    """get_recent_performance deve ritornare lista vuota se il simbolo non ha file."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    assert mm.get_recent_performance("ETHUSDC") == []
+
+
+def test_get_recent_performance_hold_has_no_pnl_fields(tmp_path: Path) -> None:
+    """get_recent_performance: i record HOLD non devono avere realized_pnl o pnl_pct."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.HOLD, execution_status=ExecutionStatus.NOT_EXECUTED),
+        current_price=None,
+    )
+
+    perf = mm.get_recent_performance("BTCUSDC")
+    assert perf[0]["action"] == "HOLD"
+    assert "realized_pnl" not in perf[0]
+    assert "pnl_pct" not in perf[0]
+
+
+# ------------------------------------------------------------------
+# get_performance_summary — casi base
+# ------------------------------------------------------------------
+
+
+def test_get_performance_summary_without_sell_returns_empty(tmp_path: Path) -> None:
+    """get_performance_summary deve ritornare stringa vuota senza SELL eseguiti."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY),
+        current_price=60000.0,
+    )
+
+    assert mm.get_performance_summary("BTCUSDC") == ""
+
+
+def test_get_performance_summary_no_data_returns_empty(tmp_path: Path) -> None:
+    """get_performance_summary deve ritornare stringa vuota senza dati."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    assert mm.get_performance_summary("BTCUSDC") == ""
+
+
+def test_get_performance_summary_profit(tmp_path: Path) -> None:
+    """Scenario base: BUY a 80000, SELL a 83000 → profitto."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    summary = mm.get_performance_summary("BTCUSDC")
+    assert "1 in profitto" in summary
+    assert "0 in perdita" in summary
+    assert "+3.75%" in summary or "+3.8%" in summary
+    assert "+3.00 USDC" in summary or "+3.0 USDC" in summary
+
+
+def test_get_performance_summary_loss(tmp_path: Path) -> None:
+    """Scenario base: BUY a 85000, SELL a 83000 → perdita."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=85000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    summary = mm.get_performance_summary("BTCUSDC")
+    assert "0 in profitto" in summary
+    assert "1 in perdita" in summary
+    assert "-" in summary
+
+
+def test_get_performance_summary_contains_fifo_label(tmp_path: Path) -> None:
+    """get_performance_summary deve contenere l'etichetta FIFO nel testo."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=82000.0,
+    )
+
+    summary = mm.get_performance_summary("BTCUSDC")
+    assert "FIFO" in summary
+
+
+# ------------------------------------------------------------------
+# compute_fifo_trades — scenari FIFO dettagliati
+# ------------------------------------------------------------------
+
+
+def test_fifo_multiple_buys_uses_oldest_first(tmp_path: Path) -> None:
+    """FIFO: con due BUY a prezzi diversi, la SELL consuma il piu vecchio."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # BUY 0.001 @ 80000 (primo)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    # BUY 0.001 @ 85000 (secondo)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=85000.0,
+    )
+    # SELL 0.001 @ 83000 → deve consumare il lotto a 80000 (+3.75%)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert len(trades) == 1
+    assert trades[0]["avg_cost_basis"] == pytest.approx(80000.0)
+    assert trades[0]["realized_pnl"] == pytest.approx(3.0, rel=1e-3)
+    assert trades[0]["pnl_pct"] == pytest.approx(3.75, rel=1e-3)
+
+
+def test_fifo_partial_sell_leaves_residual_lot(tmp_path: Path) -> None:
+    """FIFO: una vendita parziale deve lasciare la quantita residua nel lotto."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # BUY 0.003 @ 80000
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.003),
+        current_price=80000.0,
+    )
+    # SELL 0.001 @ 84000 → consuma solo 0.001 del lotto da 0.003
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=84000.0,
+    )
+    # SELL 0.001 @ 82000 → consuma un altro 0.001 dallo stesso lotto
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=82000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert len(trades) == 2
+    # Prima SELL: (84000 - 80000) * 0.001 = +4.0
+    assert trades[0]["realized_pnl"] == pytest.approx(4.0, rel=1e-3)
+    # Seconda SELL: (82000 - 80000) * 0.001 = +2.0
+    assert trades[1]["realized_pnl"] == pytest.approx(2.0, rel=1e-3)
+
+
+def test_fifo_sell_across_multiple_lots(tmp_path: Path) -> None:
+    """FIFO: una SELL che attraversa piu lotti usa il costo medio ponderato."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # BUY 0.001 @ 80000
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    # BUY 0.001 @ 90000
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=90000.0,
+    )
+    # SELL 0.002 @ 88000 → consuma entrambi i lotti
+    # costo medio = (0.001*80000 + 0.001*90000) / 0.002 = 85000
+    # P&L = 0.002 * (88000 - 85000) = +6.0
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.002),
+        current_price=88000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert len(trades) == 1
+    assert trades[0]["avg_cost_basis"] == pytest.approx(85000.0, rel=1e-6)
+    assert trades[0]["realized_pnl"] == pytest.approx(6.0, rel=1e-3)
+    assert trades[0]["quantity"] == pytest.approx(0.002, rel=1e-6)
+
+
+def test_fifo_sell_without_buy_is_ignored(tmp_path: Path) -> None:
+    """FIFO: una SELL senza BUY precedenti non deve produrre nessuna trade."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert trades == []
+
+
+def test_fifo_ignores_records_with_none_quantity(tmp_path: Path) -> None:
+    """FIFO: i record con quantity None devono essere ignorati."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # BUY con quantity None
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=None),
+        current_price=80000.0,
+    )
+    # SELL normale → nessun lotto disponibile, viene ignorata
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert trades == []
+
+
+def test_fifo_ignores_non_executed_records(tmp_path: Path) -> None:
+    """FIFO: i record non EXECUTED non devono influenzare la coda di lotti."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # BUY FAILED → non deve entrare in coda
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, execution_status=ExecutionStatus.FAILED, quantity=0.001),
+        current_price=80000.0,
+    )
+    # SELL EXECUTED → nessun lotto disponibile
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert trades == []
+
+
+def test_fifo_multiple_sell_cycles_accumulate(tmp_path: Path) -> None:
+    """FIFO: piu cicli buy/sell consecutivi devono accumularsi correttamente."""
+    mm = MemoryManager(memory_dir=tmp_path)
+
+    # Ciclo 1: BUY @ 80000, SELL @ 82000 → profitto
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=82000.0,
+    )
+    # Ciclo 2: BUY @ 85000, SELL @ 83000 → perdita
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=85000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=83000.0,
+    )
+
+    trades = mm.compute_fifo_trades("BTCUSDC")
+    assert len(trades) == 2
+    assert trades[0]["realized_pnl"] == pytest.approx(2.0, rel=1e-3)
+    assert trades[1]["realized_pnl"] == pytest.approx(-2.0, rel=1e-3)
+
+    summary = mm.get_performance_summary("BTCUSDC")
+    assert "1 in profitto" in summary
+    assert "1 in perdita" in summary
+
+
+# ------------------------------------------------------------------
+# compute_open_position
+# ------------------------------------------------------------------
+
+
+def test_compute_open_position_returns_none_when_no_buys(tmp_path: Path) -> None:
+    """Senza BUY eseguiti, non c'e posizione aperta."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    assert mm.compute_open_position("BTCUSDC") is None
+
+
+def test_compute_open_position_returns_none_after_full_sell(tmp_path: Path) -> None:
+    """Dopo che tutti i lotti BUY sono stati venduti, la posizione e chiusa."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=82000.0,
+    )
+
+    assert mm.compute_open_position("BTCUSDC") is None
+
+
+def test_compute_open_position_single_buy(tmp_path: Path) -> None:
+    """Con un solo BUY, la posizione aperta corrisponde a quel lotto."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.002),
+        current_price=80000.0,
+    )
+
+    pos = mm.compute_open_position("BTCUSDC")
+    assert pos is not None
+    assert pos["open_qty"] == pytest.approx(0.002, rel=1e-6)
+    assert pos["avg_entry_price"] == pytest.approx(80000.0, rel=1e-6)
+
+
+def test_compute_open_position_after_partial_sell(tmp_path: Path) -> None:
+    """Dopo SELL parziale, resta la quantita residua del lotto al prezzo originale."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.003),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.SELL, quantity=0.001),
+        current_price=84000.0,
+    )
+
+    pos = mm.compute_open_position("BTCUSDC")
+    assert pos is not None
+    assert pos["open_qty"] == pytest.approx(0.002, rel=1e-6)
+    assert pos["avg_entry_price"] == pytest.approx(80000.0, rel=1e-6)
+
+
+def test_compute_open_position_weighted_avg_multiple_lots(tmp_path: Path) -> None:
+    """Con piu lotti BUY aperti, il prezzo medio e la media ponderata."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=80000.0,
+    )
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=90000.0,
+    )
+
+    pos = mm.compute_open_position("BTCUSDC")
+    assert pos is not None
+    assert pos["open_qty"] == pytest.approx(0.002, rel=1e-6)
+    assert pos["avg_entry_price"] == pytest.approx(85000.0, rel=1e-6)
+
+
+# ------------------------------------------------------------------
+# Cache per-ciclo
+# ------------------------------------------------------------------
+
+
+def test_cache_serves_stale_data_until_save_cycle(tmp_path: Path) -> None:
+    """La cache mantiene i dati vecchi finché save_cycle non invalida.
+
+    Sequenza:
+    1. save_cycle (record A) -> invalida cache -> lettura aggiornata (1 record)
+    2. scrittura grezza sul file (record B, bypassando save_cycle)
+       -> la cache NON viene invalidata -> lettura ancora stale (1 record)
+    3. save_cycle (record C) -> invalida cache -> lettura aggiornata (3 record)
+    """
+    mm = MemoryManager(memory_dir=tmp_path)
+    symbol = "BTCUSDC"
+
+    # step 1: save_cycle regolare
+    mm.save_cycle(
+        symbol=symbol,
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=90000.0,
+    )
+    assert len(mm.get_memory(symbol)) == 1
+
+    # step 2: aggiunta grezza al file, bypassa save_cycle
+    symbol_path = tmp_path / f"{symbol}.jsonl"
+    with symbol_path.open("a", encoding="utf-8") as fh:
+        import json
+        fh.write(json.dumps({"action": "HOLD", "execution_status": "NOT_EXECUTED"}) + "\n")
+
+    # cache ancora valida: vede ancora solo 1 record
+    assert len(mm.get_memory(symbol)) == 1
+
+    # step 3: save_cycle invalida la cache
+    mm.save_cycle(
+        symbol=symbol,
+        result=_make_result(action=TradeAction.HOLD),
+        current_price=91000.0,
+    )
+    # ora la cache è fresca: 3 record totali (A + raw B + C)
+    assert len(mm.get_memory(symbol)) == 3
+
+
+def test_cache_invalidated_separately_per_symbol(tmp_path: Path) -> None:
+    """save_cycle invalida solo la cache del simbolo scritto, non degli altri."""
+    mm = MemoryManager(memory_dir=tmp_path)
+
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.001),
+        current_price=90000.0,
+    )
+    mm.save_cycle(
+        symbol="ETHUSDC",
+        result=_make_result(action=TradeAction.BUY, quantity=0.01),
+        current_price=3000.0,
+    )
+
+    # popola entrambe le cache
+    assert len(mm.get_memory("BTCUSDC")) == 1
+    assert len(mm.get_memory("ETHUSDC")) == 1
+
+    # aggiunge grezza su BTCUSDC bypassando save_cycle
+    btc_path = tmp_path / "BTCUSDC.jsonl"
+    with btc_path.open("a", encoding="utf-8") as fh:
+        import json
+        fh.write(json.dumps({"action": "HOLD", "execution_status": "NOT_EXECUTED"}) + "\n")
+
+    # BTCUSDC è ancora stale (cache non invalidata), ETHUSDC invariato
+    assert len(mm.get_memory("BTCUSDC")) == 1
+    assert len(mm.get_memory("ETHUSDC")) == 1
+
+    # save_cycle su BTCUSDC invalida solo quella cache
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(action=TradeAction.HOLD),
+        current_price=91000.0,
+    )
+    assert len(mm.get_memory("BTCUSDC")) == 3
+    assert len(mm.get_memory("ETHUSDC")) == 1
+
+
+# ------------------------------------------------------------------
+# compact / compact_if_needed
+# ------------------------------------------------------------------
+
+
+def test_compact_does_nothing_if_below_threshold(tmp_path: Path) -> None:
+    """Se il numero di record e' sotto la soglia, compact_if_needed non modifica nulla."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    for i in range(4):
+        mm.save_cycle("BTCUSDC", result=_make_result(), current_price=float(60000 + i))
+
+    removed = mm.compact_if_needed("BTCUSDC", threshold=5, keep_last_n=2)
+
+    assert removed == 0
+    assert len(mm._read_all("BTCUSDC")) == 4
+
+
+def test_compact_preserves_open_lots_correctly(tmp_path: Path) -> None:
+    """Dopo la compattazione, compute_open_position deve restituire lo stesso risultato."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # BUY, SELL (consuma 1° lotto), BUY aperto, HOLD
+    mm.save_cycle("BTCUSDC", result=_make_result(action=TradeAction.BUY, quantity=0.001), current_price=80000.0)
+    mm.save_cycle("BTCUSDC", result=_make_result(action=TradeAction.SELL, quantity=0.001), current_price=83000.0)
+    mm.save_cycle("BTCUSDC", result=_make_result(action=TradeAction.BUY, quantity=0.002), current_price=85000.0)
+    mm.save_cycle(
+        "BTCUSDC",
+        result=_make_result(action=TradeAction.HOLD, execution_status=ExecutionStatus.NOT_EXECUTED, quantity=None),
+        current_price=None,
+    )
+
+    pos_before = mm.compute_open_position("BTCUSDC")
+    assert pos_before is not None
+
+    mm.compact("BTCUSDC", keep_last_n=1)
+
+    pos_after = mm.compute_open_position("BTCUSDC")
+    assert pos_after is not None
+    assert pos_after["open_qty"] == pytest.approx(pos_before["open_qty"])
+    assert pos_after["avg_entry_price"] == pytest.approx(pos_before["avg_entry_price"])
+
+
+def test_compact_preserves_realized_pnl(tmp_path: Path) -> None:
+    """Dopo la compattazione, compute_fifo_trades deve dare gli stessi numeri."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    # Il BUY finira' in pre-cutoff; la SELL resta in keep_last_n=1
+    mm.save_cycle("BTCUSDC", result=_make_result(action=TradeAction.BUY, quantity=0.001), current_price=80000.0)
+    mm.save_cycle("BTCUSDC", result=_make_result(action=TradeAction.SELL, quantity=0.001), current_price=83000.0)
+
+    trades_before = mm.compute_fifo_trades("BTCUSDC")
+
+    mm.compact("BTCUSDC", keep_last_n=1)
+
+    trades_after = mm.compute_fifo_trades("BTCUSDC")
+    assert len(trades_after) == len(trades_before)
+    assert trades_after[0]["realized_pnl"] == pytest.approx(trades_before[0]["realized_pnl"])
+    assert trades_after[0]["pnl_pct"] == pytest.approx(trades_before[0]["pnl_pct"])
+
+
+def test_compact_keeps_recent_records_for_dm(tmp_path: Path) -> None:
+    """get_memory deve restituire gli ultimi 10 record reali dopo la compattazione."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    for i in range(20):
+        mm.save_cycle("BTCUSDC", result=_make_result(), current_price=float(60000 + i))
+
+    all_records = mm._read_all("BTCUSDC")
+    expected_prices = [r["price"] for r in all_records[-10:]]
+
+    mm.compact("BTCUSDC", keep_last_n=10)
+
+    memory = mm.get_memory("BTCUSDC")
+    actual_prices = [r["price"] for r in memory]
+    assert actual_prices == expected_prices
+
+
+def test_compact_invalidates_cache(tmp_path: Path) -> None:
+    """compact deve svuotare _records_cache e _fifo_cache per il simbolo."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    for i in range(5):
+        mm.save_cycle("BTCUSDC", result=_make_result(), current_price=float(60000 + i))
+
+    # popola le cache
+    mm.get_memory("BTCUSDC")
+    mm.compute_open_position("BTCUSDC")
+    assert "BTCUSDC" in mm._records_cache
+    assert "BTCUSDC" in mm._fifo_cache
+
+    mm.compact("BTCUSDC", keep_last_n=2)
+
+    assert "BTCUSDC" not in mm._records_cache
+    assert "BTCUSDC" not in mm._fifo_cache
+
+
+def test_compact_atomic_write(tmp_path: Path) -> None:
+    """Il file temporaneo .jsonl.tmp non deve restare sul disco dopo la compattazione."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    for i in range(5):
+        mm.save_cycle("BTCUSDC", result=_make_result(), current_price=float(60000 + i))
+
+    mm.compact("BTCUSDC", keep_last_n=2)
+
+    assert not (tmp_path / "BTCUSDC.jsonl.tmp").exists()
+
+
+def test_compact_if_needed_triggers_above_threshold(tmp_path: Path) -> None:
+    """Se il numero di record >= soglia, compact_if_needed deve compattare e ritornare > 0."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    for i in range(6):
+        mm.save_cycle("BTCUSDC", result=_make_result(), current_price=float(60000 + i))
+
+    removed = mm.compact_if_needed("BTCUSDC", threshold=5, keep_last_n=2)
+
+    assert removed > 0
+    real_records = [r for r in mm._read_all("BTCUSDC") if not r.get("_compacted")]
+    assert len(real_records) == 2
+
+
+def test_compact_if_needed_skips_below_threshold(tmp_path: Path) -> None:
+    """Se il numero di record < soglia, compact_if_needed non fa nulla e ritorna 0."""
+    mm = MemoryManager(memory_dir=tmp_path)
+    for i in range(4):
+        mm.save_cycle("BTCUSDC", result=_make_result(), current_price=float(60000 + i))
+
+    removed = mm.compact_if_needed("BTCUSDC", threshold=5, keep_last_n=2)
+
+    assert removed == 0
+    assert len(mm._read_all("BTCUSDC")) == 4
+
+
+# ------------------------------------------------------------------
+# save_cycle — equity_usdc
+# ------------------------------------------------------------------
+
+
+def test_save_cycle_includes_equity_usdc_when_provided(tmp_path: Path) -> None:
+    """save_cycle deve includere il campo equity_usdc se viene fornito."""
+    import json
+
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(),
+        current_price=100000.0,
+        equity_usdc=1234.56,
+    )
+
+    record = json.loads((tmp_path / "BTCUSDC.jsonl").read_text(encoding="utf-8").strip())
+    assert record["equity_usdc"] == pytest.approx(1234.56)
+
+
+def test_save_cycle_omits_equity_usdc_when_none(tmp_path: Path) -> None:
+    """save_cycle NON deve includere equity_usdc se viene passato None (retrocompatibilità)."""
+    import json
+
+    mm = MemoryManager(memory_dir=tmp_path)
+    mm.save_cycle(
+        symbol="BTCUSDC",
+        result=_make_result(),
+        current_price=100000.0,
+        equity_usdc=None,
+    )
+
+    record = json.loads((tmp_path / "BTCUSDC.jsonl").read_text(encoding="utf-8").strip())
+    assert "equity_usdc" not in record
+
+
+# ------------------------------------------------------------------
+# get_price_equity_series
+# ------------------------------------------------------------------
+
+
+def test_get_price_equity_series_returns_records_in_window(tmp_path: Path) -> None:
+    """get_price_equity_series deve ritornare solo i record nel range di date."""
+    mm = MemoryManager(memory_dir=tmp_path)
+
+    from datetime import date
+
+    # Record dentro la finestra
+    for i in range(3):
+        mm.save_cycle(
+            symbol="BTCUSDC",
+            result=_make_result(),
+            current_price=float(60000 + i * 1000),
+            equity_usdc=float(1000 + i * 100),
+        )
+
+    series = mm.get_price_equity_series(
+        "BTCUSDC",
+        since=date.today(),
+        until=date.today(),
+    )
+
+    assert len(series) == 3
+    assert series[0]["price"] == pytest.approx(60000.0)
+    assert series[0]["equity_usdc"] == pytest.approx(1000.0)
+    assert series[2]["equity_usdc"] == pytest.approx(1200.0)
+
+
+def test_get_price_equity_series_equity_none_for_old_records(tmp_path: Path) -> None:
+    """I record privi di equity_usdc devono avere equity_usdc=None nella serie."""
+    import json
+
+    mm = MemoryManager(memory_dir=tmp_path)
+    path = mm._symbol_path("BTCUSDC")
+    path.write_text(
+        json.dumps({
+            "timestamp": "2026-04-20T10:00:00",
+            "action": "HOLD",
+            "order_type": "NONE",
+            "confidence": 0.5,
+            "reason": "test",
+            "quantity": None,
+            "price": 60000.0,
+            "execution_status": "NOT_EXECUTED",
+            "risk_decision": "APPROVE",
+            "market_bias": "NEUTRAL",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    from datetime import date
+
+    series = mm.get_price_equity_series(
+        "BTCUSDC",
+        since=date(2026, 4, 20),
+        until=date(2026, 4, 20),
+    )
+
+    assert len(series) == 1
+    assert series[0]["price"] == pytest.approx(60000.0)
+    assert series[0]["equity_usdc"] is None

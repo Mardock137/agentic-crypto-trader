@@ -1,0 +1,17 @@
+min_order_usdc: 10.0
+max_order_notional_usdc: 500.0
+breakeven_trigger_pct: 2.0
+oco_review_interval_hours: 24.0
+
+mandate:
+  max_drawdown_pct: 15.0
+  horizon: "Intraday to swing (ore → giorni)"
+  max_position_pct: 70.0
+
+circuit_breaker:
+  threshold: 3
+  log_interval_seconds: 3600
+
+memory_compaction:
+  threshold: 5000
+  keep_last_n: 100

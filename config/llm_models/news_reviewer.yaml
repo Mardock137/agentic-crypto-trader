@@ -1,0 +1,4 @@
+provider: anthropic
+model: claude-sonnet-5
+thinking_effort: medium
+max_tokens: 4096

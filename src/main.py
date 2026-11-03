@@ -1,0 +1,169 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from src.agents.decision_maker import DecisionMakerAgent
+from src.agents.execution_trader import ExecutionTraderAgent
+from src.agents.market_analyst import MarketAnalystAgent
+from src.agents.news_reviewer import NewsReviewerAgent
+from src.agents.performance_reviewer import PerformanceReviewerAgent
+from src.agents.risk_manager import RiskManagerAgent
+from src.core.runner import TradingRunner
+from src.core.workflow import TradingWorkflow
+from src.integrations.exchange.binance_client import BinanceClient
+from src.integrations.llm_interfaces.anthropic_interface import AnthropicInterface
+from src.integrations.llm_interfaces.gemini_interface import GeminiInterface
+from src.integrations.llm_interfaces.openai_interface import OpenAiInterface
+from src.integrations.news.alpha_vantage_client import AlphaVantageClient
+from src.utils.config import (
+    AppSettings,
+    load_llm_model_config,
+    load_news_config,
+    load_settings,
+    load_symbol_config,
+)
+from src.utils.event_logger import EventLogger
+from src.utils.logging_config import configure_logging
+from src.utils.memory_manager import MemoryManager
+from src.utils.telegram_notifier import TelegramNotifier
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def build_runner(settings: AppSettings) -> TradingRunner:
+    """Assembla e restituisce un TradingRunner configurato e pronto per il loop."""
+    logger = configure_logging(level=settings.log_level)
+    event_logger = EventLogger()
+
+    symbol_config = load_symbol_config()
+    symbol = symbol_config["symbol"]
+    quote_currency = symbol_config["quote_currency"]
+    ma_config = load_llm_model_config(_PROJECT_ROOT / "config/llm_models/market_analyst.yaml")
+    dm_config = load_llm_model_config(_PROJECT_ROOT / "config/llm_models/decision_maker.yaml")
+    rm_config = load_llm_model_config(_PROJECT_ROOT / "config/llm_models/risk_manager.yaml")
+    pr_config = load_llm_model_config(_PROJECT_ROOT / "config/llm_models/performance_reviewer.yaml")
+
+    required_keys = {
+        "OPENAI_API_KEY": settings.openai_api_key,
+        "CLAUDE_API_KEY": settings.claude_api_key,
+        "GEMINI_API_KEY": settings.gemini_api_key,
+    }
+    missing = [name for name, value in required_keys.items() if not value]
+    if missing:
+        raise ValueError(
+            f"API key obbligatorie non configurate nel .env: {', '.join(missing)}"
+        )
+
+    # Client LLM per il Market Analyst (GPT-5.6 Terra, reasoning_effort)
+    # Nota: `temperature` non e accettata con reasoning abilitato,
+    # quindi non viene passata: l'interfaccia la ignora quando `reasoning_effort` e valorizzato.
+    ma_llm = OpenAiInterface(
+        api_key=settings.openai_api_key,
+        model=ma_config["model"],
+        reasoning_effort=ma_config.get("reasoning_effort"),
+        max_tokens=ma_config.get("max_tokens"),
+    )
+
+    # Client LLM per il Decision Maker (Claude Opus 5 con adaptive thinking)
+    # Nota: `temperature` non e accettata da Opus 5 con thinking abilitato,
+    # quindi non viene passata: l'interfaccia la ignora quando `thinking_effort` e valorizzato.
+    dm_llm = AnthropicInterface(
+        api_key=settings.claude_api_key,
+        model=dm_config["model"],
+        max_tokens=dm_config.get("max_tokens"),
+        thinking_effort=dm_config.get("thinking_effort"),
+    )
+
+    # Client LLM per il Risk Manager
+    _rm_temp_raw = rm_config.get("temperature")
+    rm_llm = GeminiInterface(
+        api_key=settings.gemini_api_key,
+        model=rm_config["model"],
+        temperature=float(_rm_temp_raw) if _rm_temp_raw is not None else None,
+        max_tokens=rm_config.get("max_tokens"),
+    )
+
+    # Client LLM per il Performance Reviewer (Claude Sonnet 5, riutilizza AnthropicInterface)
+    # Nota: `temperature` non e accettata da Sonnet 5 con thinking abilitato,
+    # quindi non viene passata: l'interfaccia la ignora quando `thinking_effort` e valorizzato.
+    pr_llm = AnthropicInterface(
+        api_key=settings.claude_api_key,
+        model=pr_config["model"],
+        max_tokens=pr_config.get("max_tokens"),
+        thinking_effort=pr_config.get("thinking_effort"),
+    )
+
+    # Client exchange
+    exchange_client = BinanceClient(settings, quote_currency=quote_currency)
+
+    workflow = TradingWorkflow(
+        market_analyst=MarketAnalystAgent(llm=ma_llm),
+        decision_maker=DecisionMakerAgent(llm=dm_llm),
+        risk_manager=RiskManagerAgent(llm=rm_llm),
+        execution_trader=ExecutionTraderAgent(
+            exchange_client=exchange_client,
+            kill_switch=settings.kill_switch,
+        ),
+    )
+
+    memory_manager = MemoryManager()
+    performance_reviewer = PerformanceReviewerAgent(llm=pr_llm)
+
+    telegram_notifier = TelegramNotifier(
+        bot_token=settings.telegram_bot_token,
+        chat_id=settings.telegram_chat_id,
+    )
+
+    news_client = None
+    news_reviewer_agent = None
+    if settings.alpha_vantage_api_key:
+        news_config = load_news_config()
+        query = news_config.get("query", {})
+        news_client = AlphaVantageClient(
+            api_key=settings.alpha_vantage_api_key,
+            topics=str(query.get("topics", "blockchain")),
+            tickers=str(query.get("tickers", "")),
+            lookback_hours=int(query.get("lookback_hours", 12)),
+            max_articles=int(query.get("max_articles", 50)),
+            sort=str(query.get("sort", "LATEST")),
+        )
+        nr_config = load_llm_model_config(
+            _PROJECT_ROOT / "config/llm_models/news_reviewer.yaml"
+        )
+        # Nota: `temperature` non e accettata da Sonnet 5 con thinking abilitato,
+        # quindi non viene passata: l'interfaccia la ignora quando `thinking_effort` e valorizzato.
+        nr_llm = AnthropicInterface(
+            api_key=settings.claude_api_key,
+            model=nr_config["model"],
+            max_tokens=nr_config.get("max_tokens"),
+            thinking_effort=nr_config.get("thinking_effort"),
+        )
+        news_reviewer_agent = NewsReviewerAgent(llm=nr_llm)
+    else:
+        logger.warning(
+            "ALPHA_VANTAGE_API_KEY non configurata: News Reviewer disabilitato"
+        )
+
+    return TradingRunner(
+        workflow=workflow,
+        event_logger=event_logger,
+        logger=logger,
+        settings=settings,
+        symbol=symbol,
+        exchange_client=exchange_client,
+        memory_manager=memory_manager,
+        performance_reviewer=performance_reviewer,
+        telegram_notifier=telegram_notifier,
+        news_client=news_client,
+        news_reviewer=news_reviewer_agent,
+    )
+
+
+def main() -> None:
+    settings = load_settings()
+    runner = build_runner(settings)
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()

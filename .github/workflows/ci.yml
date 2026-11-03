@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout codice
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Audit dipendenze
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+      - name: Lancia i test
+        run: python -m pytest
